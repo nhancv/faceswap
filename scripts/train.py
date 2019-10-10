@@ -12,10 +12,11 @@ import cv2
 import tensorflow as tf
 from keras.backend.tensorflow_backend import set_session
 
+from lib.image import read_image
 from lib.keypress import KBHit
 from lib.multithreading import MultiThread
-from lib.queue_manager import queue_manager
-from lib.utils import cv2_read_img, get_folder, get_image_paths, set_system_verbosity
+from lib.queue_manager import queue_manager  # noqa pylint:disable=unused-import
+from lib.utils import get_folder, get_image_paths, set_system_verbosity, deprecation_warning
 from plugins.plugin_loader import PluginLoader
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
@@ -89,6 +90,16 @@ class Train():
         """ Call the training process object """
         logger.debug("Starting Training Process")
         logger.info("Training data directory: %s", self.args.model_dir)
+
+        # TODO Move these args to config and remove these deprecation warnings
+        if hasattr(self.args, "warp_to_landmarks") and self.args.warp_to_landmarks:
+            deprecation_warning("`-wl`, ``--warp-to-landmarks``",
+                                additional_info="This option will be available within training "
+                                                "config settings (/config/train.ini).")
+        if hasattr(self.args, "no_augment_color") and self.args.no_flip:
+            deprecation_warning("`-nac`, ``--no-augment-color``",
+                                additional_info="This option will be available within training "
+                                                "config settings (/config/train.ini).")
         set_system_verbosity(self.args.loglevel)
         thread = self.start_thread()
         # queue_manager.debug_monitor(1)
@@ -134,14 +145,13 @@ class Train():
 
             if self.args.allow_growth:
                 self.set_tf_allow_growth()
-
             model = self.load_model()
             trainer = self.load_trainer(model)
             self.run_training_cycle(model, trainer)
         except KeyboardInterrupt:
             try:
                 logger.debug("Keyboard Interrupt Caught. Saving Weights and exiting")
-                model.save_models(False)
+                model.save_models()
                 trainer.clear_tensorboard()
             except KeyboardInterrupt:
                 logger.info("Saving model weights has been cancelled!")
@@ -157,8 +167,9 @@ class Train():
         augment_color = not self.args.no_augment_color
         model = PluginLoader.get_model(self.trainer_name)(
             model_dir,
-            self.args.gpus,
+            gpus=self.args.gpus,
             configfile=configfile,
+            snapshot_interval=self.args.snapshot_interval,
             no_logs=self.args.no_logs,
             warp_to_landmarks=self.args.warp_to_landmarks,
             augment_color=augment_color,
@@ -168,6 +179,7 @@ class Train():
             preview_scale=self.args.preview_scale,
             pingpong=self.args.pingpong,
             memory_saving_gradients=self.args.memory_saving_gradients,
+            optimizer_savings=self.args.optimizer_savings,
             predict=False)
         logger.debug("Loaded Model")
         return model
@@ -175,7 +187,7 @@ class Train():
     @property
     def image_size(self):
         """ Get the training set image size for storing in model data """
-        image = cv2_read_img(self.images["a"][0], raise_error=True)
+        image = read_image(self.images["a"][0], raise_error=True)
         size = image.shape[0]
         logger.debug("Training image size: %s", size)
         return size
@@ -214,9 +226,6 @@ class Train():
 
         for iteration in range(0, self.args.iterations):
             logger.trace("Training iteration: %s", iteration)
-            snapshot_iteration = bool(self.args.snapshot_interval != 0 and
-                                      iteration >= self.args.snapshot_interval and
-                                      iteration % self.args.snapshot_interval == 0)
             save_iteration = iteration % self.args.save_interval == 0
             viewer = display_func if save_iteration or self.save_now else None
             timelapse = self.timelapse if save_iteration else None
@@ -227,16 +236,16 @@ class Train():
             if save_iteration:
                 logger.trace("Save Iteration: (iteration: %s", iteration)
                 if self.args.pingpong:
-                    model.save_models(snapshot_iteration)
+                    model.save_models()
                     trainer.pingpong.switch()
                 else:
-                    model.save_models(snapshot_iteration)
+                    model.save_models()
             elif self.save_now:
                 logger.trace("Save Requested: (iteration: %s", iteration)
-                model.save_models(False)
+                model.save_models()
                 self.save_now = False
         logger.debug("Training cycle complete")
-        model.save_models(False)
+        model.save_models()
         trainer.clear_tensorboard()
         self.stop = True
 
@@ -244,15 +253,15 @@ class Train():
         """ Monitor the console, and generate + monitor preview if requested """
         is_preview = self.args.preview
         logger.debug("Launching Monitor")
-        logger.info("R|===================================================")
-        logger.info("R|  Starting")
+        logger.info("===================================================")
+        logger.info("  Starting")
         if is_preview:
-            logger.info("R|  Using live preview")
-        logger.info("R|  Press '%s' to save and quit",
+            logger.info("  Using live preview")
+        logger.info("  Press '%s' to save and quit",
                     "Terminate" if self.args.redirect_gui else "ENTER")
         if not self.args.redirect_gui:
-            logger.info("R|  Press 'S' to save model weights immediately")
-        logger.info("R|===================================================")
+            logger.info("  Press 'S' to save model weights immediately")
+        logger.info("===================================================")
 
         keypress = KBHit(is_gui=self.args.redirect_gui)
         err = False

@@ -3,6 +3,7 @@
 import logging
 import os
 import platform
+import re
 import sys
 import tkinter as tk
 from tkinter import filedialog, ttk
@@ -10,10 +11,12 @@ from threading import Event, Thread
 from queue import Queue
 import numpy as np
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 from lib.Serializer import JSONSerializer
-from .tooltip import Tooltip
+
+from ._config import Config as UserConfig
+from ._redirector import WidgetRedirector
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 _CONFIG = None
@@ -48,22 +51,6 @@ def initialize_images(pathcache=None):
 def get_images():
     """ return the _CONFIG constant """
     return _IMAGES
-
-
-def set_slider_rounding(value, var, d_type, round_to, min_max):
-    """ Set the underlying variable to correct number based on slider rounding """
-    if d_type == float:
-        var.set(round(float(value), round_to))
-    else:
-        steps = range(min_max[0], min_max[1] + round_to, round_to)
-        value = min(steps, key=lambda x: abs(x - int(float(value))))
-        var.set(value)
-
-
-def adjust_wraplength(event):
-    """ dynamically adjust the wraplength of a label on event """
-    label = event.widget
-    label.configure(wraplength=event.width - 1)
 
 
 class FileHandler():
@@ -107,14 +94,14 @@ class FileHandler():
         filetypes = {"default": (all_files,),
                      "alignments": [("JSON", "*.json"),
                                     ("Pickle", "*.p"),
-                                    ("YAML", "*.yaml" "*.yml"),  # pylint: disable=W1403
+                                    ("YAML", "*.yaml *.yml"),
                                     all_files],
                      "config": [("Faceswap GUI config files", "*.fsw"), all_files],
                      "csv": [("Comma separated values", "*.csv"), all_files],
                      "image": [("Bitmap", "*.bmp"),
-                               ("JPG", "*.jpeg" "*.jpg"),  # pylint: disable=W1403
+                               ("JPG", "*.jpeg *.jpg"),
                                ("PNG", "*.png"),
-                               ("TIFF", "*.tif" "*.tiff"),  # pylint: disable=W1403
+                               ("TIFF", "*.tif *.tiff"),
                                all_files],
                      "ini": [("Faceswap config files", "*.ini"), all_files],
                      "state": [("State files", "*.json"), all_files],
@@ -124,8 +111,9 @@ class FileHandler():
                                ("Matroska", "*.mkv"),
                                ("MOV", "*.mov"),
                                ("MP4", "*.mp4"),
-                               ("MPEG", "*.mpeg"),
+                               ("MPEG", "*.mpeg *.mpg"),
                                ("WebM", "*.webm"),
+                               ("Windows Media Video", "*.wmv"),
                                all_files]}
         # Add in multi-select options
         for key, val in filetypes.items():
@@ -232,6 +220,10 @@ class Images():
         self.pathoutput = None
         self.previewoutput = None
         self.previewtrain = dict()
+        self.previewcache = dict(modified=None,  # cache for extract and convert
+                                 images=None,
+                                 filenames=list(),
+                                 placeholder=None)
         self.errcount = 0
         self.icons = dict()
         self.icons["folder"] = ImageTk.PhotoImage(file=os.path.join(
@@ -259,6 +251,13 @@ class Images():
                 fullitem = os.path.join(self.pathpreview, item)
                 logger.debug("Deleting: '%s'", fullitem)
                 os.remove(fullitem)
+        for fname in self.previewcache["filenames"]:
+            if os.path.basename(fname) == ".gui_preview.jpg":
+                logger.debug("Deleting: '%s'", fname)
+                try:
+                    os.remove(fname)
+                except FileNotFoundError:
+                    logger.debug("File does not exist: %s", fname)
         self.clear_image_cache()
 
     def clear_image_cache(self):
@@ -267,79 +266,178 @@ class Images():
         self.pathoutput = None
         self.previewoutput = None
         self.previewtrain = dict()
+        self.previewcache = dict(modified=None,  # cache for extract and convert
+                                 images=None,
+                                 filenames=list(),
+                                 placeholder=None)
 
     @staticmethod
     def get_images(imgpath):
         """ Get the images stored within the given directory """
-        logger.trace("Getting images: '%s'", imgpath)
+        logger.debug("Getting images: '%s'", imgpath)
         if not os.path.isdir(imgpath):
             logger.debug("Folder does not exist")
             return None
         files = [os.path.join(imgpath, f)
                  for f in os.listdir(imgpath) if f.lower().endswith((".png", ".jpg"))]
-        logger.trace("Image files: %s", files)
+        logger.debug("Image files: %s", files)
         return files
 
     def load_latest_preview(self, thumbnail_size, frame_dims):
         """ Load the latest preview image for extract and convert """
-        logger.trace("Loading preview image: (thumbnail_size: %s, frame_dims: %s)",
+        logger.debug("Loading preview image: (thumbnail_size: %s, frame_dims: %s)",
                      thumbnail_size, frame_dims)
         imagefiles = self.get_images(self.pathoutput)
-        if not imagefiles or len(imagefiles) == 1:
+        gui_preview = os.path.join(self.pathoutput, ".gui_preview.jpg")
+        if not imagefiles or (len(imagefiles) == 1 and gui_preview not in imagefiles):
             logger.debug("No preview to display")
             self.previewoutput = None
             return
-        logger.trace("Image Files: %s", len(imagefiles))
-        num_images = (frame_dims[0] // thumbnail_size) * (frame_dims[1] // thumbnail_size)
-        if num_images > len(imagefiles):
-            logger.debug("Not enough images to generate display. (to display: %s, available "
-                         "images: %s)", num_images, len(imagefiles))
+        # Filter to just the gui_preview if it exists in folder output
+        imagefiles = [gui_preview] if gui_preview in imagefiles else imagefiles
+        logger.debug("Image Files: %s", len(imagefiles))
+
+        imagefiles = self.get_newest_filenames(imagefiles)
+        if not imagefiles:
+            return
+
+        self.load_images_to_cache(imagefiles, frame_dims, thumbnail_size)
+        if imagefiles == [gui_preview]:
+            # Delete the preview image so that the main scripts know to output another
+            logger.debug("Deleting preview image")
+            os.remove(imagefiles[0])
+        show_image = self.place_previews(frame_dims)
+        if not show_image:
             self.previewoutput = None
             return
-        filenames, samples = self.get_preview_samples(imagefiles, num_images, thumbnail_size)
-        show_image = self.place_previews(samples, frame_dims)
-        logger.trace("Displaying preview: '%s'", filenames)
+        logger.debug("Displaying preview: %s", self.previewcache["filenames"])
         self.previewoutput = (show_image, ImageTk.PhotoImage(show_image))
 
-    @staticmethod
-    def get_preview_samples(imagefiles, num_images, thumbnail_size):
-        """ Return a subset of the imagefiles images
-            Exclude final file so we don't accidentally load a file that is being saved """
-        logger.trace("num_images: %s", num_images)
+    def get_newest_filenames(self, imagefiles):
+        """ Return image filenames that have been modified since the last check """
+        if self.previewcache["modified"] is None:
+            retval = imagefiles
+        else:
+            retval = [fname for fname in imagefiles
+                      if os.path.getmtime(fname) > self.previewcache["modified"]]
+        if not retval:
+            logger.debug("No new images in output folder")
+        else:
+            self.previewcache["modified"] = max([os.path.getmtime(img) for img in retval])
+            logger.debug("Number new images: %s, Last Modified: %s",
+                         len(retval), self.previewcache["modified"])
+        return retval
+
+    def load_images_to_cache(self, imagefiles, frame_dims, thumbnail_size):
+        """ Load new images and append to cache, filtering to the number of display images """
+        logger.debug("Number imagefiles: %s, frame_dims: %s, thumbnail_size: %s",
+                     len(imagefiles), frame_dims, thumbnail_size)
+        num_images = (frame_dims[0] // thumbnail_size) * (frame_dims[1] // thumbnail_size)
+        logger.debug("num_images: %s", num_images)
+        if num_images == 0:
+            return
         samples = list()
-        start_idx = len(imagefiles) - (num_images + 1)
-        end_idx = len(imagefiles) - 1
-        logger.trace("start_idx: %s, end_idx: %s", start_idx, end_idx)
-        show_files = sorted(imagefiles, key=os.path.getctime)[start_idx: end_idx]
+        start_idx = len(imagefiles) - num_images if len(imagefiles) > num_images else 0
+        show_files = sorted(imagefiles, key=os.path.getctime)[start_idx:]
         for fname in show_files:
             img = Image.open(fname)
-            img.thumbnail((thumbnail_size, thumbnail_size))
+            width, height = img.size
+            scaling = thumbnail_size / max(width, height)
+            logger.debug("image width: %s, height: %s, scaling: %s", width, height, scaling)
+            img = img.resize((int(width * scaling), int(height * scaling)))
             if img.size[0] != img.size[1]:
                 # Pad to square
                 new_img = Image.new("RGB", (thumbnail_size, thumbnail_size))
                 new_img.paste(img, ((thumbnail_size - img.size[0])//2,
                                     (thumbnail_size - img.size[1])//2))
                 img = new_img
+            draw = ImageDraw.Draw(img)
+            draw.rectangle(((0, 0), (thumbnail_size, thumbnail_size)), outline="#E5E5E5", width=1)
             samples.append(np.array(img))
         samples = np.array(samples)
-        logger.trace("Samples shape: %s", samples.shape)
-        return show_files, samples
+        self.previewcache["filenames"] = (self.previewcache["filenames"] +
+                                          show_files)[-num_images:]
+        cache = self.previewcache["images"]
+        if cache is None:
+            logger.debug("Creating new cache")
+            cache = samples[-num_images:]
+        else:
+            logger.debug("Appending to existing cache")
+            cache = np.concatenate((cache, samples))[-num_images:]
+        self.previewcache["images"] = cache
+        logger.debug("Cache shape: %s", self.previewcache["images"].shape)
 
     @staticmethod
-    def place_previews(samples, frame_dims):
+    def get_preview_samples(imagefiles, num_images, thumbnail_size):
+        """ Return a subset of the imagefiles images
+            Exclude final file so we don't accidentally load a file that is being saved """
+        logger.debug("num_images: %s", num_images)
+        samples = list()
+        start_idx = len(imagefiles) - (num_images + 1)
+        end_idx = len(imagefiles) - 1
+        logger.debug("start_idx: %s, end_idx: %s", start_idx, end_idx)
+        show_files = sorted(imagefiles, key=os.path.getctime)[start_idx: end_idx]
+        for fname in show_files:
+            img = Image.open(fname)
+            width, height = img.size
+            scaling = thumbnail_size / max(width, height)
+            logger.debug("image width: %s, height: %s, scaling: %s", width, height, scaling)
+            img = img.resize((int(width * scaling), int(height * scaling)))
+            if img.size[0] != img.size[1]:
+                # Pad to square
+                new_img = Image.new("RGB", (thumbnail_size, thumbnail_size))
+                new_img.paste(img, ((thumbnail_size - img.size[0])//2,
+                                    (thumbnail_size - img.size[1])//2))
+                img = new_img
+            draw = ImageDraw.Draw(img)
+            draw.rectangle(((0, 0), (thumbnail_size, thumbnail_size)), outline="#E5E5E5", width=1)
+            samples.append(np.array(img))
+        samples = np.array(samples)
+        logger.debug("Samples shape: %s", samples.shape)
+        return show_files, samples
+
+    def place_previews(self, frame_dims):
         """ Stack the preview images to fit display """
+        if self.previewcache.get("images", None) is None:
+            logger.debug("No images in cache. Returning None")
+            return None
+        samples = self.previewcache["images"].copy()
         num_images, thumbnail_size = samples.shape[:2]
-        logger.trace("num_images: %s, thumbnail_size: %s", num_images, thumbnail_size)
+        if self.previewcache["placeholder"] is None:
+            self.create_placeholder(thumbnail_size)
+
+        logger.debug("num_images: %s, thumbnail_size: %s", num_images, thumbnail_size)
         cols, rows = frame_dims[0] // thumbnail_size, frame_dims[1] // thumbnail_size
-        logger.trace("cols: %s, rows: %s", cols, rows)
+        logger.debug("cols: %s, rows: %s", cols, rows)
+        if cols == 0 or rows == 0:
+            logger.debug("Cols or Rows is zero. No items to display")
+            return None
+        remainder = (cols * rows) - num_images
+        if remainder != 0:
+            logger.debug("Padding sample display. Remainder: %s", remainder)
+            placeholder = np.concatenate([np.expand_dims(self.previewcache["placeholder"],
+                                                         0)] * remainder)
+            samples = np.concatenate((samples, placeholder))
+
         display = np.vstack([np.hstack(samples[row * cols: (row + 1) * cols])
                              for row in range(rows)])
-        logger.trace("display shape: %s", display.shape)
+        logger.debug("display shape: %s", display.shape)
         return Image.fromarray(display)
+
+    def create_placeholder(self, thumbnail_size):
+        """ Create a placeholder image for when there are fewer samples available
+            then columns to display them """
+        logger.debug("Creating placeholder. thumbnail_size: %s", thumbnail_size)
+        placeholder = Image.new("RGB", (thumbnail_size, thumbnail_size))
+        draw = ImageDraw.Draw(placeholder)
+        draw.rectangle(((0, 0), (thumbnail_size, thumbnail_size)), outline="#E5E5E5", width=1)
+        placeholder = np.array(placeholder)
+        self.previewcache["placeholder"] = placeholder
+        logger.debug("Created placeholder. shape: %s", placeholder.shape)
 
     def load_training_preview(self):
         """ Load the training preview images """
-        logger.trace("Loading Training preview images")
+        logger.debug("Loading Training preview images")
         imagefiles = self.get_images(self.pathpreview)
         modified = None
         if not imagefiles:
@@ -352,7 +450,7 @@ class Images():
             name = os.path.splitext(name)[0]
             name = name[name.rfind("_") + 1:].title()
             try:
-                logger.trace("Displaying preview: '%s'", img)
+                logger.debug("Displaying preview: '%s'", img)
                 size = self.get_current_size(name)
                 self.previewtrain[name] = [Image.open(img), None, modified]
                 self.resize_image(name, size)
@@ -372,20 +470,20 @@ class Images():
 
     def get_current_size(self, name):
         """ Return the size of the currently displayed image """
-        logger.trace("Getting size: '%s'", name)
+        logger.debug("Getting size: '%s'", name)
         if not self.previewtrain.get(name, None):
             return None
         img = self.previewtrain[name][1]
         if not img:
             return None
-        logger.trace("Got size: (name: '%s', width: '%s', height: '%s')",
+        logger.debug("Got size: (name: '%s', width: '%s', height: '%s')",
                      name, img.width(), img.height())
         return img.width(), img.height()
 
     def resize_image(self, name, framesize):
         """ Resize the training preview image
             based on the passed in frame size """
-        logger.trace("Resizing image: (name: '%s', framesize: %s", name, framesize)
+        logger.debug("Resizing image: (name: '%s', framesize: %s", name, framesize)
         displayimg = self.previewtrain[name][0]
         if framesize:
             frameratio = float(framesize[0]) / float(framesize[1])
@@ -397,7 +495,7 @@ class Images():
             else:
                 scale = framesize[1] / float(displayimg.size[1])
                 size = (int(displayimg.size[0] * scale), framesize[1])
-            logger.trace("Scaling: (scale: %s, size: %s", scale, size)
+            logger.debug("Scaling: (scale: %s, size: %s", scale, size)
 
             # Hacky fix to force a reload if it happens to find corrupted
             # data, probably due to reading the image whilst it is partially
@@ -414,42 +512,16 @@ class Images():
         self.previewtrain[name][1] = ImageTk.PhotoImage(displayimg)
 
 
-class ContextMenu(tk.Menu):  # pylint: disable=too-many-ancestors
-    """ Pop up menu """
-    def __init__(self, widget):
-        logger.debug("Initializing %s: (widget_class: '%s')",
-                     self.__class__.__name__, widget.winfo_class())
-        super().__init__(tearoff=0)
-        self.widget = widget
-        self.standard_actions()
-        logger.debug("Initialized %s", self.__class__.__name__)
-
-    def standard_actions(self):
-        """ Standard menu actions """
-        self.add_command(label="Cut", command=lambda: self.widget.event_generate("<<Cut>>"))
-        self.add_command(label="Copy", command=lambda: self.widget.event_generate("<<Copy>>"))
-        self.add_command(label="Paste", command=lambda: self.widget.event_generate("<<Paste>>"))
-        self.add_separator()
-        self.add_command(label="Select all", command=self.select_all)
-
-    def cm_bind(self):
-        """ Bind the menu to the widget's Right Click event """
-        button = "<Button-2>" if platform.system() == "Darwin" else "<Button-3>"
-        logger.debug("Binding '%s' to '%s'", button, self.widget.winfo_class())
-        scaling_factor = get_config().scaling_factor if get_config() is not None else 1.0
-        x_offset = int(34 * scaling_factor)
-        self.widget.bind(button,
-                         lambda event: self.tk_popup(event.x_root + x_offset, event.y_root, 0))
-
-    def select_all(self):
-        """ Select all for Text or Entry widgets """
-        logger.debug("Selecting all for '%s'", self.widget.winfo_class())
-        if self.widget.winfo_class() == "Text":
-            self.widget.focus_force()
-            self.widget.tag_add("sel", "1.0", "end")
-        else:
-            self.widget.focus_force()
-            self.widget.select_range(0, tk.END)
+class ReadOnlyText(tk.Text):  # pylint: disable=too-many-ancestors
+    """ A read only text widget that redirects a standard tk.Text widget's insert and delete
+    attributes.
+    Source: https://stackoverflow.com/questions/3842155
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.redirector = WidgetRedirector(self)
+        self.insert = self.redirector.register("insert", lambda *args, **kw: "break")
+        self.delete = self.redirector.register("delete", lambda *args, **kw: "break")
 
 
 class ConsoleOut(ttk.Frame):  # pylint: disable=too-many-ancestors
@@ -461,13 +533,14 @@ class ConsoleOut(ttk.Frame):  # pylint: disable=too-many-ancestors
         ttk.Frame.__init__(self, parent)
         self.pack(side=tk.TOP, anchor=tk.W, padx=10, pady=(2, 0),
                   fill=tk.BOTH, expand=True)
-        self.console = tk.Text(self)
+        self.console = ReadOnlyText(self)
         rc_menu = ContextMenu(self.console)
         rc_menu.cm_bind()
         self.console_clear = get_config().tk_vars['consoleclear']
         self.set_console_clear_var_trace()
         self.debug = debug
         self.build_console()
+        self.add_tags()
         logger.debug("Initialized %s", self.__class__.__name__)
 
     def set_console_clear_var_trace(self):
@@ -488,6 +561,17 @@ class ConsoleOut(ttk.Frame):  # pylint: disable=too-many-ancestors
 
         self.redirect_console()
         logger.debug("Built console")
+
+    def add_tags(self):
+        """ Add tags to text widget to color based on output """
+        logger.debug("Adding text color tags")
+        self.console.tag_config("default", foreground="#1E1E1E")
+        self.console.tag_config("stderr", foreground="#E25056")
+        self.console.tag_config("info", foreground="#2B445E")
+        self.console.tag_config("verbose", foreground="#008140")
+        self.console.tag_config("warning", foreground="#F77B00")
+        self.console.tag_config("critical", foreground="red")
+        self.console.tag_config("error", foreground="red")
 
     def redirect_console(self):
         """ Redirect stdout/stderr to console frame """
@@ -518,13 +602,24 @@ class SysOutRouter():
                      self.__class__.__name__, console, out_type)
         self.console = console
         self.out_type = out_type
-        self.color = ("black" if out_type == "stdout" else "red")
+        self.recolor = re.compile(r".+?(\s\d+:\d+:\d+\s)(?P<lvl>[A-Z]+)\s")
         logger.debug("Initialized %s", self.__class__.__name__)
+
+    def get_tag(self, string):
+        """ Set the tag based on regex of log output """
+        if self.out_type == "stderr":
+            # Output all stderr in red
+            return self.out_type
+
+        output = self.recolor.match(string)
+        if not output:
+            return "default"
+        tag = output.groupdict()["lvl"].strip().lower()
+        return tag
 
     def write(self, string):
         """ Capture stdout/stderr """
-        self.console.insert(tk.END, string, self.out_type)
-        self.console.tag_config(self.out_type, foreground=self.color)
+        self.console.insert(tk.END, string, self.get_tag(string))
         self.console.see(tk.END)
 
     @staticmethod
@@ -550,9 +645,19 @@ class Config():
         self.statusbar = statusbar
         self.serializer = JSONSerializer
         self.tk_vars = self.set_tk_vars()
+        self.user_config = UserConfig(None)
+        self.user_config_dict = self.user_config.config_dict
         self.command_notebook = None  # set in command.py
         self.session = session
         logger.debug("Initialized %s", self.__class__.__name__)
+
+    @property
+    def default_font(self):
+        """ Return the selected font """
+        font = self.user_config_dict["font"]
+        if font == "default":
+            font = tk.font.nametofont("TkDefaultFont").configure()["family"]
+        return (font, self.user_config_dict["font_size"])
 
     @property
     def command_tabs(self):
@@ -719,216 +824,42 @@ class Config():
             out.write(recent_json.encode("utf-8"))
 
 
-class ControlBuilder():
-    # TODO Expand out for cli options
-    """
-    Builds and returns a frame containing a tkinter control with label
+class ContextMenu(tk.Menu):  # pylint: disable=too-many-ancestors
+    """ Pop up menu """
+    def __init__(self, widget):
+        logger.debug("Initializing %s: (widget_class: '%s')",
+                     self.__class__.__name__, widget.winfo_class())
+        super().__init__(tearoff=0)
+        self.widget = widget
+        self.standard_actions()
+        logger.debug("Initialized %s", self.__class__.__name__)
 
-    Currently only setup for config items
+    def standard_actions(self):
+        """ Standard menu actions """
+        self.add_command(label="Cut", command=lambda: self.widget.event_generate("<<Cut>>"))
+        self.add_command(label="Copy", command=lambda: self.widget.event_generate("<<Copy>>"))
+        self.add_command(label="Paste", command=lambda: self.widget.event_generate("<<Paste>>"))
+        self.add_separator()
+        self.add_command(label="Select all", command=self.select_all)
 
-    Parameters
-    ----------
-    parent: tkinter object
-        Parent tkinter object
-    title: str
-        Title of the control. Will be used for label text
-    dtype: datatype object
-        Datatype of the control
-    default: str
-        Default value for the control
-    selected_value: str, optional
-        Selected value for the control. If None, default will be used
-    choices: list or tuple, object
-        Used for combo boxes and radio control option setting
-    is_radio: bool, optional
-        Specifies to use a Radio control instead of combobox if choices are passed
-    rounding: int or float, optional
-        For slider controls. Sets the stepping
-    min_max: int or float, optional
-        For slider controls. Sets the min and max values
-    helptext: str, optional
-        Sets the tooltip text
-    radio_columns: int, optional
-        Sets the number of columns to use for grouping radio buttons
-    label_width: int, optional
-        Sets the width of the control label. Defaults to 20
-    control_width: int, optional
-        Sets the width of the control. Default is to auto expand
-    """
-    def __init__(self, parent, title, dtype, default,
-                 selected_value=None, choices=None, is_radio=False, rounding=None,
-                 min_max=None, helptext=None, radio_columns=3, label_width=20, control_width=None):
-        logger.debug("Initializing %s: (parent: %s, title: %s, dtype: %s, default: %s, "
-                     "selected_value: %s, choices: %s, is_radio: %s, rounding: %s, min_max: %s, "
-                     "helptext: %s, radio_columns: %s, label_width: %s, control_width: %s)",
-                     self.__class__.__name__, parent, title, dtype, default, selected_value,
-                     choices, is_radio, rounding, min_max, helptext, radio_columns, label_width,
-                     control_width)
+    def cm_bind(self):
+        """ Bind the menu to the widget's Right Click event """
+        button = "<Button-2>" if platform.system() == "Darwin" else "<Button-3>"
+        logger.debug("Binding '%s' to '%s'", button, self.widget.winfo_class())
+        scaling_factor = get_config().scaling_factor if get_config() is not None else 1.0
+        x_offset = int(34 * scaling_factor)
+        self.widget.bind(button,
+                         lambda event: self.tk_popup(event.x_root + x_offset, event.y_root, 0))
 
-        self.title = title
-        self.default = default
-
-        self.frame = self.control_frame(parent, helptext)
-        self.control = self.set_control(dtype, choices, is_radio)
-        self.tk_var = self.set_tk_var(dtype, selected_value)
-
-        self.build_control(choices,
-                           dtype,
-                           rounding,
-                           min_max,
-                           radio_columns,
-                           label_width,
-                           control_width)
-        logger.debug("Initialized: %s", self.__class__.__name__)
-
-    # Frame, control type and varable
-    def control_frame(self, parent, helptext):
-        """ Frame to hold control and it's label """
-        logger.debug("Build control frame")
-        frame = ttk.Frame(parent)
-        frame.pack(side=tk.TOP, fill=tk.X)
-        if helptext is not None:
-            helptext = self.format_helptext(helptext)
-            Tooltip(frame, text=helptext, wraplength=720)
-        logger.debug("Built control frame")
-        return frame
-
-    def format_helptext(self, helptext):
-        """ Format the help text for tooltips """
-        logger.debug("Format control help: '%s'", self.title)
-        helptext = helptext.replace("\n\t", "\n  - ").replace("%%", "%")
-        helptext = self.title + " - " + helptext
-        logger.debug("Formatted control help: (title: '%s', help: '%s'", self.title, helptext)
-        return helptext
-
-    def set_control(self, dtype, choices, is_radio):
-        """ Set the correct control type based on the datatype or for this option """
-        if choices and is_radio:
-            control = ttk.Radiobutton
-        elif choices:
-            control = ttk.Combobox
-        elif dtype == bool:
-            control = ttk.Checkbutton
-        elif dtype in (int, float):
-            control = ttk.Scale
+    def select_all(self):
+        """ Select all for Text or Entry widgets """
+        logger.debug("Selecting all for '%s'", self.widget.winfo_class())
+        if self.widget.winfo_class() == "Text":
+            self.widget.focus_force()
+            self.widget.tag_add("sel", "1.0", "end")
         else:
-            control = ttk.Entry
-        logger.debug("Setting control '%s' to %s", self.title, control)
-        return control
-
-    def set_tk_var(self, dtype, selected_value):
-        """ Correct variable type for control """
-        logger.debug("Setting tk variable: (title: '%s', dtype: %s, selected_value: %s)",
-                     self.title, dtype, selected_value)
-        if dtype == bool:
-            var = tk.BooleanVar
-        elif dtype == int:
-            var = tk.IntVar
-        elif dtype == float:
-            var = tk.DoubleVar
-        else:
-            var = tk.StringVar
-        var = var(self.frame)
-        val = self.default if selected_value is None else selected_value
-        var.set(val)
-        logger.debug("Set tk variable: (title: '%s', type: %s, value: '%s')",
-                     self.title, type(var), val)
-        return var
-
-    # Build the full control
-    def build_control(self, choices, dtype, rounding, min_max, radio_columns,
-                      label_width, control_width):
-        """ Build the correct control type for the option passed through """
-        logger.debug("Build confog option control")
-        self.build_control_label(label_width)
-        self.build_one_control(choices, dtype, rounding, min_max, radio_columns, control_width)
-        logger.debug("Built option control")
-
-    def build_control_label(self, label_width):
-        """ Label for control """
-        logger.debug("Build control label: (title: '%s', label_width: %s)",
-                     self.title, label_width)
-        title = self.title.replace("_", " ").title()
-        lbl = ttk.Label(self.frame, text=title, width=label_width, anchor=tk.W)
-        lbl.pack(padx=5, pady=5, side=tk.LEFT, anchor=tk.N)
-        logger.debug("Built control label: '%s'", self.title)
-
-    def build_one_control(self, choices, dtype, rounding, min_max, radio_columns, control_width):
-        """ Build and place the option controls """
-        logger.debug("Build control: (title: '%s', control: %s, choices: %s, dtype: %s, "
-                     "rounding: %s, min_max: %s: radio_columns: %s, control_width: %s)",
-                     self.title, self.control, choices, dtype, rounding, min_max, radio_columns,
-                     control_width)
-        if self.control == ttk.Scale:
-            ctl = self.slider_control(dtype, rounding, min_max)
-        elif self.control == ttk.Radiobutton:
-            ctl = self.radio_control(choices, radio_columns)
-        else:
-            ctl = self.control_to_optionsframe(choices)
-        self.set_control_width(ctl, control_width)
-        ctl.pack(padx=5, pady=5, fill=tk.X, expand=True)
-        logger.debug("Built control: '%s'", self.title)
-
-    @staticmethod
-    def set_control_width(ctl, control_width):
-        """ Set the control width if required """
-        if control_width is not None:
-            ctl.config(width=control_width)
-
-    def radio_control(self, choices, columns):
-        """ Create a group of radio buttons """
-        logger.debug("Adding radio group: %s", self.title)
-        ctl = ttk.Frame(self.frame)
-        frames = list()
-        for _ in range(columns):
-            frame = ttk.Frame(ctl)
-            frame.pack(padx=5, pady=5, fill=tk.X, expand=True, side=tk.LEFT, anchor=tk.N)
-            frames.append(frame)
-
-        for idx, choice in enumerate(choices):
-            frame_id = idx % columns
-            radio = ttk.Radiobutton(frames[frame_id],
-                                    text=choice.title(),
-                                    value=choice,
-                                    variable=self.tk_var)
-            radio.pack(anchor=tk.W)
-            logger.debug("Adding radio option %s to column %s", choice, frame_id)
-        logger.debug("Added radio group: '%s'", self.title)
-        return ctl
-
-    def slider_control(self, dtype, rounding, min_max):
-        """ A slider control with corresponding Entry box """
-        logger.debug("Add slider control to Options Frame: (title: '%s', dtype: %s, rounding: %s, "
-                     "min_max: %s)", self.title, dtype, rounding, min_max)
-        tbox = ttk.Entry(self.frame, width=8, textvariable=self.tk_var, justify=tk.RIGHT)
-        tbox.pack(padx=(0, 5), side=tk.RIGHT)
-        ctl = self.control(
-            self.frame,
-            variable=self.tk_var,
-            command=lambda val, var=self.tk_var, dt=dtype, rn=rounding, mm=min_max:
-            set_slider_rounding(val, var, dt, rn, mm))
-        rc_menu = ContextMenu(tbox)
-        rc_menu.cm_bind()
-        ctl["from_"] = min_max[0]
-        ctl["to"] = min_max[1]
-        logger.debug("Added slider control to Options Frame: %s", self.title)
-        return ctl
-
-    def control_to_optionsframe(self, choices):
-        """ Standard non-check buttons sit in the main options frame """
-        logger.debug("Add control to Options Frame: (title: '%s', control: %s, choices: %s)",
-                     self.title, self.control, choices)
-        if self.control == ttk.Checkbutton:
-            ctl = self.control(self.frame, variable=self.tk_var, text=None)
-        else:
-            ctl = self.control(self.frame, textvariable=self.tk_var)
-            rc_menu = ContextMenu(ctl)
-            rc_menu.cm_bind()
-        if choices:
-            logger.debug("Adding combo choices: %s", choices)
-            ctl["values"] = [choice for choice in choices]
-        logger.debug("Added control to Options Frame: %s", self.title)
-        return ctl
+            self.widget.focus_force()
+            self.widget.select_range(0, tk.END)
 
 
 class LongRunningTask(Thread):

@@ -1,36 +1,94 @@
 #!/usr/bin python3
 """ Utilities available across all scripts """
 
+import json
 import logging
 import os
 import sys
 import urllib
 import warnings
 import zipfile
-from socket import timeout as socket_timeout, error as socket_error
 
-from hashlib import sha1
 from pathlib import Path
 from re import finditer
-
-import cv2
-import numpy as np
+from multiprocessing import current_process
+from socket import timeout as socket_timeout, error as socket_error
 
 from tqdm import tqdm
 
-from lib.faces_detect import BoundingBox, DetectedFace
-
-
 # Global variables
-_image_extensions = [  # pylint: disable=invalid-name
+_image_extensions = [  # pylint:disable=invalid-name
     ".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff"]
-_video_extensions = [  # pylint: disable=invalid-name
-    ".avi", ".flv", ".mkv", ".mov", ".mp4", ".mpeg", ".webm"]
+_video_extensions = [  # pylint:disable=invalid-name
+    ".avi", ".flv", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm", ".wmv"]
+
+
+class Backend():
+    """ Return the backend from config/.faceswap
+        if file doesn't exist, create it """
+    def __init__(self):
+        self.backends = {"1": "amd", "2": "cpu", "3": "nvidia"}
+        self.config_file = self.get_config_file()
+        self.backend = self.get_backend()
+
+    @staticmethod
+    def get_config_file():
+        """ Return location of config file """
+        pypath = os.path.dirname(os.path.realpath(sys.argv[0]))
+        config_file = os.path.join(pypath, "config", ".faceswap")
+        return config_file
+
+    def get_backend(self):
+        """ Return the backend from config/.faceswap """
+        # Intercept for sphinx docs build
+        if sys.argv[0].endswith("sphinx-build"):
+            return "nvidia"
+        if not os.path.isfile(self.config_file):
+            self.configure_backend()
+        while True:
+            try:
+                with open(self.config_file, "r") as cnf:
+                    config = json.load(cnf)
+                break
+            except json.decoder.JSONDecodeError:
+                self.configure_backend()
+                continue
+        fs_backend = config.get("backend", None)
+        if fs_backend is None or fs_backend.lower() not in self.backends.values():
+            fs_backend = self.configure_backend()
+        if current_process().name == "MainProcess":
+            print("Setting Faceswap backend to {}".format(fs_backend.upper()))
+        return fs_backend.lower()
+
+    def configure_backend(self):
+        """ Configure the backend if config file doesn't exist or there is a
+            problem with the file """
+        print("First time configuration. Please select the required backend")
+        while True:
+            selection = input("1: AMD, 2: CPU, 3: NVIDIA: ")
+            if selection not in ("1", "2", "3"):
+                print("'{}' is not a valid selection. Please try again".format(selection))
+                continue
+            break
+        fs_backend = self.backends[selection].lower()
+        config = {"backend": fs_backend}
+        with open(self.config_file, "w") as cnf:
+            json.dump(config, cnf)
+        print("Faceswap config written to: {}".format(self.config_file))
+        return fs_backend
+
+
+_FS_BACKEND = Backend().backend
+
+
+def get_backend():
+    """ Return the faceswap backend """
+    return _FS_BACKEND
 
 
 def get_folder(path, make_folder=True):
     """ Return a path to a folder, creating it if it doesn't exist """
-    logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+    logger = logging.getLogger(__name__)  # pylint:disable=invalid-name
     logger.debug("Requested path: '%s'", path)
     output_dir = Path(path)
     if not make_folder and not output_dir.exists():
@@ -43,7 +101,7 @@ def get_folder(path, make_folder=True):
 
 def get_image_paths(directory):
     """ Return a list of images that reside in a folder """
-    logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+    logger = logging.getLogger(__name__)  # pylint:disable=invalid-name
     image_extensions = _image_extensions
     dir_contents = list()
 
@@ -65,9 +123,25 @@ def get_image_paths(directory):
     return dir_contents
 
 
+def convert_to_secs(*args):
+    """ converts a time to second. Either convert_to_secs(min, secs) or
+        convert_to_secs(hours, mins, secs). """
+    logger = logging.getLogger(__name__)  # pylint:disable=invalid-name
+    logger.debug("from time: %s", args)
+    retval = 0.0
+    if len(args) == 1:
+        retval = float(args[0])
+    elif len(args) == 2:
+        retval = 60 * float(args[0]) + float(args[1])
+    elif len(args) == 3:
+        retval = 3600 * float(args[0]) + 60 * float(args[1]) + float(args[2])
+    logger.debug("to secs: %s", retval)
+    return retval
+
+
 def full_path_split(path):
     """ Split a given path into all of it's separate components """
-    logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+    logger = logging.getLogger(__name__)  # pylint:disable=invalid-name
     allparts = list()
     while True:
         parts = os.path.split(path)
@@ -84,63 +158,9 @@ def full_path_split(path):
     return allparts
 
 
-def cv2_read_img(filename, raise_error=False):
-    """ Read an image with cv2 and check that an image was actually loaded.
-        Logs an error if the image returned is None. or an error has occured.
-
-        Pass raise_error=True if error should be raised """
-    logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
-    logger.trace("Requested image: '%s'", filename)
-    success = True
-    image = None
-    try:
-        image = cv2.imread(filename)  # pylint: disable=no-member
-        if image is None:
-            raise ValueError
-    except TypeError:
-        success = False
-        msg = "Error while reading image (TypeError): '{}'".format(filename)
-        logger.error(msg)
-        if raise_error:
-            raise Exception(msg)
-    except ValueError:
-        success = False
-        msg = ("Error while reading image. This is most likely caused by special characters in "
-               "the filename: '{}'".format(filename))
-        logger.error(msg)
-        if raise_error:
-            raise Exception(msg)
-    except Exception as err:  # pylint: disable=broad-except
-        success = False
-        msg = "Failed to load image '{}'. Original Error: {}".format(filename, str(err))
-        logger.error(msg)
-        if raise_error:
-            raise Exception(msg)
-    logger.trace("Loaded image: '%s'. Success: %s", filename, success)
-    return image
-
-
-def hash_image_file(filename):
-    """ Return an image file's sha1 hash """
-    logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
-    img = cv2_read_img(filename, raise_error=True)
-    img_hash = sha1(img).hexdigest()
-    logger.trace("filename: '%s', hash: %s", filename, img_hash)
-    return img_hash
-
-
-def hash_encode_image(image, extension):
-    """ Encode the image, get the hash and return the hash with
-        encoded image """
-    img = cv2.imencode(extension, image)[1]  # pylint: disable=no-member
-    f_hash = sha1(
-        cv2.imdecode(img, cv2.IMREAD_UNCHANGED)).hexdigest()  # pylint: disable=no-member
-    return f_hash, img
-
-
 def backup_file(directory, filename):
     """ Backup a given file by appending .bk to the end """
-    logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+    logger = logging.getLogger(__name__)  # pylint:disable=invalid-name
     logger.trace("Backing up: '%s'", filename)
     origfile = os.path.join(directory, filename)
     backupfile = origfile + '.bk'
@@ -173,7 +193,7 @@ def set_system_verbosity(loglevel):
         2 - filter out WARNING logs
         3 - filter out ERROR logs  """
 
-    logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+    logger = logging.getLogger(__name__)  # pylint:disable=invalid-name
     from lib.logger import get_loglevel
     numeric_level = get_loglevel(loglevel)
     loglevel = "2" if numeric_level > 15 else "0"
@@ -184,85 +204,14 @@ def set_system_verbosity(loglevel):
             warnings.simplefilter(action='ignore', category=warncat)
 
 
-def rotate_landmarks(face, rotation_matrix):
-    # pylint: disable=c-extension-no-member
-    """ Rotate the landmarks and bounding box for faces
-        found in rotated images.
-        Pass in a DetectedFace object, Alignments dict or BoundingBox"""
-    logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
-    logger.trace("Rotating landmarks: (rotation_matrix: %s, type(face): %s",
-                 rotation_matrix, type(face))
-    if isinstance(face, DetectedFace):
-        bounding_box = [[face.x, face.y],
-                        [face.x + face.w, face.y],
-                        [face.x + face.w, face.y + face.h],
-                        [face.x, face.y + face.h]]
-        landmarks = face.landmarksXY
-
-    elif isinstance(face, dict):
-        bounding_box = [[face.get("x", 0), face.get("y", 0)],
-                        [face.get("x", 0) + face.get("w", 0),
-                         face.get("y", 0)],
-                        [face.get("x", 0) + face.get("w", 0),
-                         face.get("y", 0) + face.get("h", 0)],
-                        [face.get("x", 0),
-                         face.get("y", 0) + face.get("h", 0)]]
-        landmarks = face.get("landmarksXY", list())
-
-    elif isinstance(face, BoundingBox):
-        bounding_box = [[face.left, face.top],
-                        [face.right, face.top],
-                        [face.right, face.bottom],
-                        [face.left, face.bottom]]
-        landmarks = list()
-    else:
-        raise ValueError("Unsupported face type")
-
-    logger.trace("Original landmarks: %s", landmarks)
-
-    rotation_matrix = cv2.invertAffineTransform(  # pylint: disable=no-member
-        rotation_matrix)
-    rotated = list()
-    for item in (bounding_box, landmarks):
-        if not item:
-            continue
-        points = np.array(item, np.int32)
-        points = np.expand_dims(points, axis=0)
-        transformed = cv2.transform(points,  # pylint: disable=no-member
-                                    rotation_matrix).astype(np.int32)
-        rotated.append(transformed.squeeze())
-
-    # Bounding box should follow x, y planes, so get min/max
-    # for non-90 degree rotations
-    pt_x = min([pnt[0] for pnt in rotated[0]])
-    pt_y = min([pnt[1] for pnt in rotated[0]])
-    pt_x1 = max([pnt[0] for pnt in rotated[0]])
-    pt_y1 = max([pnt[1] for pnt in rotated[0]])
-
-    if isinstance(face, DetectedFace):
-        face.x = int(pt_x)
-        face.y = int(pt_y)
-        face.w = int(pt_x1 - pt_x)
-        face.h = int(pt_y1 - pt_y)
-        face.r = 0
-        if len(rotated) > 1:
-            rotated_landmarks = [tuple(point) for point in rotated[1].tolist()]
-            face.landmarksXY = rotated_landmarks
-    elif isinstance(face, dict):
-        face["x"] = int(pt_x)
-        face["y"] = int(pt_y)
-        face["w"] = int(pt_x1 - pt_x)
-        face["h"] = int(pt_y1 - pt_y)
-        face["r"] = 0
-        if len(rotated) > 1:
-            rotated_landmarks = [tuple(point) for point in rotated[1].tolist()]
-            face["landmarksXY"] = rotated_landmarks
-    else:
-        rotated_landmarks = BoundingBox(pt_x, pt_y, pt_x1, pt_y1)
-        face = rotated_landmarks
-
-    logger.trace("Rotated landmarks: %s", rotated_landmarks)
-    return face
+def deprecation_warning(func_name, additional_info=None):
+    """ Log at warning level that a function will be removed in future """
+    logger = logging.getLogger(__name__)  # pylint:disable=invalid-name
+    logger.debug("func_name: %s, additional_info: %s", func_name, additional_info)
+    msg = "{}  has been deprecated and will be removed from a future update.".format(func_name)
+    if additional_info is not None:
+        msg += " {}".format(additional_info)
+    logger.warning(msg)
 
 
 def camel_case_split(identifier):
@@ -274,19 +223,19 @@ def camel_case_split(identifier):
     return [m.group(0) for m in matches]
 
 
-def safe_shutdown():
+def safe_shutdown(got_error=False):
     """ Close queues, threads and processes in event of crash """
-    logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+    logger = logging.getLogger(__name__)  # pylint:disable=invalid-name
     logger.debug("Safely shutting down")
     from lib.queue_manager import queue_manager
-    from lib.multithreading import terminate_processes
     queue_manager.terminate_queues()
-    terminate_processes()
     logger.debug("Cleanup complete. Shutting down queue manager and exiting")
-    queue_manager._log_queue.put(None)  # pylint: disable=protected-access
-    while not queue_manager._log_queue.empty():  # pylint: disable=protected-access
-        continue
-    queue_manager.manager.shutdown()
+    exit(1 if got_error else 0)
+
+
+class FaceswapError(Exception):
+    """ Faceswap Error for handling specific errors with useful information """
+    pass  # pylint:disable=unnecessary-pass
 
 
 class GetModel():
@@ -313,7 +262,7 @@ class GetModel():
         """
 
     def __init__(self, model_filename, cache_dir, git_model_id):
-        self.logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+        self.logger = logging.getLogger(__name__)  # pylint:disable=invalid-name
         if not isinstance(model_filename, list):
             model_filename = [model_filename]
         self.model_filename = model_filename

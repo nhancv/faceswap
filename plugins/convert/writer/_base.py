@@ -30,6 +30,14 @@ class Output():
         self.cache = dict()  # Cache for when frames must be written in correct order
         logger.debug("Initialized %s", self.__class__.__name__)
 
+    @property
+    def is_stream(self):
+        """ Return whether the writer is a stream or images
+            Writers that write to a stream have a frame_order paramater to dictate
+            the order in which frames should be written out (eg. gif/ffmpeg) """
+        retval = hasattr(self, "frame_order")
+        return retval
+
     def output_filename(self, filename):
         """ Return the output filename with the correct folder and extension
             NB: The plugin must have a config item 'format' that contains the
@@ -45,6 +53,7 @@ class Output():
         frame_no = int(re.search(self.re_search, filename).group())
         self.cache[frame_no] = image
         logger.trace("Added to cache. Frame no: %s", frame_no)
+        logger.trace("Current cache: %s", sorted(self.cache.keys()))
 
     def write(self, filename, image):
         """ Override for specific frame writing method """

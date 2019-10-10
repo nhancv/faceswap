@@ -138,7 +138,7 @@ A desktop shortcut can be added to easily launch straight into the faceswap GUI:
 
 ## Updating faceswap
 It's good to keep faceswap up to date as new features are added and bugs are fixed. To do so:
-- If using the GUI you can go to the Tools Menu and select "Check for Updates...". This will update faceswap to the latest code and update your dependencies.
+- If using the GUI you can go to the Help menu and select "Check for Updates...". If updates are available go to the Help menu and select "Update Faceswap". Restart Faceswap to complete the update.
 - If you are not already in your virtual environment follow [these steps](#entering-your-virtual-environment)
 - Enter the faceswap folder: `cd faceswap`
 - Enter the following `git pull --all`
@@ -151,8 +151,8 @@ Git is required for obtaining the code and keeping your codebase up to date.
 Obtain git for your distribution from the [git website](https://git-scm.com/downloads).
 
 ### Python
-The recommended install method is to use a Conda3 Environment as this will handle the installation of Nvidia's CUDA and cuDNN straight into your Conda Environment.
-  - [MiniConda3](https://docs.conda.io/en/latest/miniconda.html)
+The recommended install method is to use a Conda3 Environment as this will handle the installation of Nvidia's CUDA and cuDNN straight into your Conda Environment. This is by far the easiest and most reliable way to setup the project.
+  - MiniConda3 is recommended: [MiniConda3](https://docs.conda.io/en/latest/miniconda.html)
   
 Alternatively you can install Python (>= 3.2-3.7 64-bit) for your distribution (links below.) If you go down this route and are using an Nvidia GPU you should install CUDA (https://developer.nvidia.com/cuda-zone) and cuDNN (https://developer.nvidia.com/cudnn). for your system. If you do not plan to build Tensorflow yourself, make sure you install no higher than version 10.0 of CUDA and 7.5.x of CUDNN.
   - Python distributions:
@@ -280,4 +280,4 @@ Proceed to [../blob/master/USAGE.md](USAGE.md)
 ## Notes
 This guide is far from complete. Functionality may change over time, and new dependencies are added and removed as time goes on. 
 
-If you are experiencing issues, please raise them in the [faceswap-playground](https://github.com/deepfakes/faceswap-playground) repository instead of the main repo.
+If you are experiencing issues, please raise them in the [faceswap Forum](https://faceswap.dev/forum) instead of the main repo. Usage questions raised in the issues within this repo are liable to be closed without response.
